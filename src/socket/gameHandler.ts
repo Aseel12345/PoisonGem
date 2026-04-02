@@ -8,21 +8,55 @@ import {
 } from '../types/game';
 import { verifyCommitment } from '../utils/crypto';
 import { getRoom, saveRoom, toPublic, getNextTurn } from './roomHandler';
+import {
+  gemPickLimiter,
+  poisonCommitLimiter,
+} from '../middleware/rateLimiter';
+import {
+  validateSocketPayload,
+  validateUidOwnership,
+  validateGemIndex,
+} from '../middleware/validation';
+import { logAction, detectSuspiciousActivity } from '../utils/actionLogger';
 
 const AFK_TIMEOUT_MS = 15_000; // 15 seconds per turn
 
 export function registerGameHandlers(
   io: Server,
   socket: Socket,
-  redis: RedisClientType
+  redis: RedisClientType,
+  authenticatedUid: string
 ) {
+  const pickLimiter = gemPickLimiter(redis);
+  const commitLimiter = poisonCommitLimiter(redis);
+
   // ── Commit Poison ────────────────────────────────────────────────────────────
   // Each player secretly selects a gem to poison.
   // Client sends both the hash AND the actual gemIndex.
   // Server stores gemIndex privately, broadcasts only that a commitment was made.
   socket.on('game:commit_poison', async (payload: CommitPoisonPayload) => {
     try {
-      const { uid, roomCode, commitHash, gemIndex, salt } = payload;
+      const { valid, error } = validateSocketPayload(payload,
+        ['uid', 'roomCode', 'commitHash', 'gemIndex', 'salt']);
+      if (!valid) {
+        socket.emit('error', { code: 'INVALID_PAYLOAD', message: error });
+        return;
+      }
+
+      // ── Phase 2: UID ownership check ───────────────────────────────────────
+      if (!validateUidOwnership(payload.uid, authenticatedUid)) {
+        socket.emit('error', { code: 'UID_MISMATCH', message: 'UID mismatch' });
+        return;
+      }
+
+      // Rate limit commits
+      const rateResult = await commitLimiter(authenticatedUid);
+      if (!rateResult.allowed) {
+        socket.emit('error', { code: 'RATE_LIMITED', message: 'Too many commit attempts' });
+        return;
+      }
+
+      const { roomCode, commitHash, gemIndex, salt } = payload;
       const room = await getRoom(redis, roomCode);
 
       if (!room || room.status !== 'poisoning') {
@@ -30,28 +64,41 @@ export function registerGameHandlers(
         return;
       }
 
-      const player = room.players.find(p => p.uid === uid);
+      const player = room.players.find(p => p.uid === authenticatedUid);
       if (!player || !player.isAlive) return;
 
       // Prevent double-commit
-      if (room.poisonCommitments.find(c => c.uid === uid)) {
+      if (room.poisonCommitments.find(c => c.uid === authenticatedUid)) {
         socket.emit('error', { code: 'ALREADY_COMMITTED', message: 'Already committed poison' });
         return;
       }
 
-      // Validate gem index is within bounds and not already eliminated
-      if (gemIndex < 0 || gemIndex >= room.gems.length) {
-        socket.emit('error', { code: 'INVALID_GEM', message: 'Invalid gem index' });
+      // ── Phase 2: Validate gem index range ─────────────────────────────────
+      const gemError = validateGemIndex(gemIndex, room.gems.length);
+      if (gemError) {
+        socket.emit('error', { code: 'INVALID_GEM', message: gemError });
+        return;
+      }
+
+      // ── Phase 2: Validate hash matches on server too ──────────────────────
+      if (typeof commitHash !== 'string' || commitHash.length !== 64) {
+        socket.emit('error', { code: 'INVALID_HASH', message: 'Invalid commitment hash' });
+        return;
+      }
+      if (typeof salt !== 'string' || salt.length !== 32) {
+        socket.emit('error', { code: 'INVALID_SALT', message: 'Invalid salt' });
         return;
       }
 
       // Verify the hash matches (client built the hash, server double-checks)
       if (!verifyCommitment(gemIndex, salt, commitHash)) {
         socket.emit('error', { code: 'HASH_MISMATCH', message: 'Commitment hash mismatch — possible tampering' });
+        // Log this — it's a strong signal of tampering
+        console.warn(`[AntiCheat] Hash mismatch from uid ${authenticatedUid} in room ${roomCode}`);
         return;
       }
 
-      room.poisonCommitments.push({ uid, commitHash, salt, gemIndex });
+      room.poisonCommitments.push({ uid: authenticatedUid, commitHash, salt, gemIndex });
       await saveRoom(redis, room);
 
       // Tell all players how many commitments have been made (not who/which gem)
@@ -62,6 +109,14 @@ export function registerGameHandlers(
 
       // Confirm to the committing player
       socket.emit('game:poison_committed', { success: true });
+
+      await logAction(redis, {
+        actionType: 'game:commit_poison',
+        uid: authenticatedUid,
+        roomCode,
+        data: { gemIndex, commitHash },
+        timestamp: Date.now(),
+      });
 
       // All alive players committed → start the game
       const alivePlayers = room.players.filter(p => p.isAlive);
@@ -88,7 +143,26 @@ export function registerGameHandlers(
   // Server-side authoritative pick — client sends intent, server validates everything.
   socket.on('game:pick_gem', async (payload: PickGemPayload) => {
     try {
-      const { uid, roomCode, gemIndex } = payload;
+      const { valid, error } = validateSocketPayload(payload, ['uid', 'roomCode', 'gemIndex']);
+      if (!valid) {
+        socket.emit('error', { code: 'INVALID_PAYLOAD', message: error });
+        return;
+      }
+
+      // ── Phase 2: UID ownership check ───────────────────────────────────────
+      if (!validateUidOwnership(payload.uid, authenticatedUid)) {
+        socket.emit('error', { code: 'UID_MISMATCH', message: 'UID mismatch' });
+        return;
+      }
+
+      // ── Phase 2: Rate limit picks — 1 per second ──────────────────────────
+      const rateResult = await pickLimiter(authenticatedUid);
+      if (!rateResult.allowed) {
+        socket.emit('error', { code: 'RATE_LIMITED', message: 'Picking too fast' });
+        return;
+      }
+
+      const { roomCode, gemIndex } = payload;
       const room = await getRoom(redis, roomCode);
 
       if (!room || room.status !== 'playing') {
@@ -96,15 +170,22 @@ export function registerGameHandlers(
         return;
       }
 
-      // Validate it's this player's turn
-      if (room.currentTurnUid !== uid) {
+      // ── Phase 2: Server-side turn validation ──────────────────────────────
+      if (room.currentTurnUid !== authenticatedUid) {
         socket.emit('error', { code: 'NOT_YOUR_TURN', message: 'Not your turn' });
         return;
       }
 
-      const player = room.players.find(p => p.uid === uid);
+      const player = room.players.find(p => p.uid === authenticatedUid);
       if (!player || !player.isAlive) {
         socket.emit('error', { code: 'NOT_ALIVE', message: 'You are not alive' });
+        return;
+      }
+
+      // ── Phase 2: Validate gem index range ─────────────────────────────────
+      const gemError = validateGemIndex(gemIndex, room.gems.length);
+      if (gemError) {
+        socket.emit('error', { code: 'INVALID_GEM', message: gemError });
         return;
       }
 
@@ -128,74 +209,84 @@ export function registerGameHandlers(
       if (wasPoison) {
         // Picker dies
         player.isAlive = false;
-        eliminatedUid = uid;
+        eliminatedUid = authenticatedUid;
 
         // Update stats in MongoDB (fire-and-forget, don't block game)
-        updatePoisonStats(poisonedBy!.uid, uid).catch(console.error);
-
-        const alivePlayers = room.players.filter(p => p.isAlive);
-
-        if (alivePlayers.length === 1) {
-          // Game over — last player alive wins
-          room.status = 'finished';
-          room.winnerUid = alivePlayers[0].uid;
-          room.currentTurnUid = null;
-          await saveRoom(redis, room);
-
-          const eventPayload: GemPickedPayload = {
-            pickerUid: uid,
-            gemIndex,
-            wasPoison: true,
-            poisonedByUid: poisonedBy!.uid,
-            eliminatedUid: uid,
-            nextTurnUid: null,
-          };
-          io.to(roomCode).emit('game:gem_picked', eventPayload);
-
-          // Small delay so clients can animate death before seeing game over
-          setTimeout(async () => {
-            const winner = alivePlayers[0];
-            const gameOverPayload: GameOverPayload = {
-              winnerUid: winner.uid,
-              winnerUsername: winner.username,
-              poisonReveals: room.poisonCommitments.map(c => ({
-                uid: c.uid,
-                username: room.players.find(p => p.uid === c.uid)?.username ?? '',
-                gemIndex: c.gemIndex,
-                salt: c.salt,
-                commitHash: c.commitHash,
-              })),
-            };
-            io.to(roomCode).emit('game:over', gameOverPayload);
-            updateWinStats(winner.uid).catch(console.error);
-          }, 2000);
-
-          return;
-
-        } else if (alivePlayers.length === 0) {
-          // Shouldn't happen but handle gracefully
-          room.status = 'finished';
-          room.winnerUid = null;
-          await saveRoom(redis, room);
-          io.to(roomCode).emit('game:over', { winnerUid: null, winnerUsername: null, poisonReveals: [] });
-          return;
-        }
-
-        // More than 1 alive — game continues without the dead player
-        nextTurnUid = getNextTurn(room.turnOrder, uid, alivePlayers.map(p => p.uid));
-
-      } else {
-        // Safe pick — advance turn normally
-        const alivePlayers = room.players.filter(p => p.isAlive);
-        nextTurnUid = getNextTurn(room.turnOrder, uid, alivePlayers.map(p => p.uid));
+        updatePoisonStats(poisonedBy!.uid, authenticatedUid).catch(console.error);
       }
+
+      const alivePlayers = room.players.filter(p => p.isAlive);
+
+      await logAction(redis, {
+        actionType: 'game:pick_gem',
+        uid: authenticatedUid,
+        roomCode,
+        data: { gemIndex, wasPoison },
+        timestamp: Date.now(),
+      });
+
+      // Suspicious activity check after each pick
+      const { suspicious, reason } = await detectSuspiciousActivity(redis, authenticatedUid, roomCode);
+      if (suspicious) {
+        console.warn(`[AntiCheat] ${authenticatedUid} flagged: ${reason}`);
+      }
+
+      if (alivePlayers.length <= 1) {
+        // Game over
+        room.status = 'finished';
+        room.winnerUid = alivePlayers[0]?.uid ?? null;
+        room.currentTurnUid = null;
+        await saveRoom(redis, room);
+
+        const eventPayload: GemPickedPayload = {
+          pickerUid: authenticatedUid,
+          gemIndex,
+          wasPoison,
+          poisonedByUid: poisonedBy?.uid ?? null,
+          eliminatedUid,
+          nextTurnUid: null,
+        };
+        io.to(roomCode).emit('game:gem_picked', eventPayload);
+
+        // Small delay so clients can animate death before seeing game over
+        setTimeout(async () => {
+          const winner = alivePlayers[0];
+          const gameOverPayload: GameOverPayload = {
+            winnerUid: winner?.uid ?? null,
+            winnerUsername: winner?.username ?? null,
+            poisonReveals: room.poisonCommitments.map(c => ({
+              uid: c.uid,
+              username: room.players.find(p => p.uid === c.uid)?.username ?? '',
+              gemIndex: c.gemIndex,
+              salt: c.salt,
+              commitHash: c.commitHash,
+            })),
+          };
+          io.to(roomCode).emit('game:over', gameOverPayload);
+
+          await logAction(redis, {
+            actionType: 'game:over',
+            uid: winner?.uid ?? 'none',
+            roomCode,
+            data: { winnerUid: winner?.uid },
+            timestamp: Date.now(),
+          });
+
+          if (winner) updateWinStats(winner.uid).catch(console.error);
+        }, 2000);
+
+        return;
+      }
+
+      // Safe pick or poison pick (with more players alive) — advance turn normally
+      nextTurnUid = getNextTurn(room.turnOrder, authenticatedUid, alivePlayers.map(p => p.uid));
 
       room.currentTurnUid = nextTurnUid;
       room.afkTimerStart = Date.now();
       await saveRoom(redis, room);
 
       const eventPayload: GemPickedPayload = {
-        pickerUid: uid,
+        pickerUid: authenticatedUid,
         gemIndex,
         wasPoison,
         poisonedByUid: poisonedBy?.uid ?? null,
@@ -240,9 +331,15 @@ function scheduleAfkCheck(
       const randomGem = available[Math.floor(Math.random() * available.length)];
       console.log(`[AFK] Auto-picking gem ${randomGem.index} for ${expectedUid} in room ${roomCode}`);
 
+      await logAction(redis, {
+        actionType: 'game:afk_pick',
+        uid: expectedUid,
+        roomCode,
+        data: { gemIndex: randomGem.index },
+        timestamp: Date.now(),
+      });
+
       // Emit as if the player picked it — reuse pick logic via internal emit
-      // We emit directly to the server's own socket handler by emitting a fake event
-      // Actually cleaner to duplicate the pick logic here:
       io.to(roomCode).emit('game:afk_pick', { uid: expectedUid, gemIndex: randomGem.index });
 
       // Process the pick server-side (inline the pick logic)
@@ -322,5 +419,5 @@ async function updatePoisonStats(poisonerUid: string, victimUid: string) {
 
 async function updateWinStats(winnerUid: string) {
   const { User } = await import('../models/User');
-  await User.updateOne({ _id: winnerUid }, { $inc: { 'stats.wins': 1 } });
+  await User.updateOne({ _id: winnerUid }, { $inc: { 'stats.wins': 1, 'stats.matchesPlayed': 1 } });
 }
